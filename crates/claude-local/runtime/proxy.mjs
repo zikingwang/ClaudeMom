@@ -1555,6 +1555,13 @@ function mockApi(req, res, url) {
   if (method === "GET" && p === "/api/directory/servers") {
     return json(res, { servers: [], next_cursor: null });
   }
+  // 插件目录页校验 {data:[...]}；通用 {} 会触发 RegistryFetchError: expected array。
+  if (method === "GET" && (p === "/api/directory/plugins" || /^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(p))) {
+    return json(res, { data: [], next_page: null, facets: {}, omitted: [] });
+  }
+  if (method === "GET" && /\/dxt\/(?:extensions|installable_extensions)$/.test(p)) {
+    return json(res, { entries: [], total: 0 });
+  }
   if (method === "GET" && /^\/api\/organizations\/[^/]+\/activation\/[^/]+\/tasks$/.test(p)) {
     return json(res, { tasks: [] });
   }
@@ -2208,6 +2215,12 @@ function handle(req, res, hostHeader) {
           organization: { uuid: ORG.uuid, name: ORG.name },
         });
       }
+      if (url.pathname === "/api/directory/plugins" || /^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(url.pathname)) {
+        return json(res, { data: [], next_page: null, facets: {}, omitted: [] });
+      }
+      if (/\/dxt\/(?:extensions|installable_extensions)$/.test(url.pathname)) {
+        return json(res, { entries: [], total: 0 });
+      }
       // 远端托管策略：本地空放行（不挡插件/连接器）。
       // CLI 比 Desktop 校验更严格，settings 响应必须包含 uuid/checksum/settings。
       // policy_limits → {restrictions:{},compliance_taints:[],defaults:{}}（BymwSUZ2 校验器）
@@ -2626,6 +2639,12 @@ const outer = http.createServer((req, res) => {
   // 会话 apiHost=127.0.0.1:8899 时，托管设置/policy 也会打到这里：本地 mock，别转 magpie
   if (/^\/api\/claude_cli\/bootstrap/.test(u.pathname)) {
     return json(res, { client_data: {}, settings: {}, config: {}, enabled: true, environments: [], sessions: [], plugins: [], items: [], data: [] });
+  }
+  if (u.pathname === "/api/directory/plugins" || /^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(u.pathname)) {
+    return json(res, { data: [], next_page: null, facets: {}, omitted: [] });
+  }
+  if (/\/dxt\/(?:extensions|installable_extensions)$/.test(u.pathname)) {
+    return json(res, { entries: [], total: 0 });
   }
   if (/^\/api\/claude_code\/policy_limits/.test(u.pathname)) {
     return json(res, POLICY_LIMITS);

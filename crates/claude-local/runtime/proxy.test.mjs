@@ -819,6 +819,33 @@ for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {
   });
 }
 
+for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {
+  test(`plugin directory returns an array page over ${host || "direct HTTP"}`, async () => {
+    for (const pathname of ["/api/directory/plugins", "/api/organizations/local/directory/plugins"]) {
+      const result = await request(pathname, { host });
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body.data, []);
+      assert.equal(result.body.next_page, null);
+      assert.deepEqual(result.body.facets, {});
+      assert.deepEqual(result.body.omitted, []);
+    }
+  });
+}
+
+for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {
+  test(`DXT extension lists return entries and total over ${host || "direct HTTP"}`, async () => {
+    for (const pathname of [
+      "/api/organizations/local/dxt/extensions",
+      "/api/organizations/local/dxt/installable_extensions",
+    ]) {
+      const result = await request(pathname, { host });
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body.entries, []);
+      assert.equal(result.body.total, 0);
+    }
+  });
+}
+
 test("chat and cowork session title endpoints generate and persist titles via gateway", async () => {
   const created = await request("/api/organizations/11111111-2222-4333-8444-555555555556/chat_conversations", {
     host: "claude.ai",
