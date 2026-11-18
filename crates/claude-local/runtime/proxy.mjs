@@ -953,9 +953,13 @@ function scanLocalSkills() {
     }
   }
   const rows = [];
+  // 目录名和 frontmatter 里的 name 可能不一样（前端点开技能时传的是 id 即 name）
+  const byId = new Map();
   for (const [folder, dir] of dirs) {
     const meta = skillFrontmatter(path.join(dir, SKILL_MANIFEST));
     const name = typeof meta.name === "string" && meta.name.trim() ? meta.name.trim() : folder;
+    if (byId.has(name)) continue;
+    byId.set(name, dir);
     let stat = null;
     try {
       stat = fs.statSync(path.join(dir, SKILL_MANIFEST));
@@ -990,9 +994,8 @@ function scanLocalSkills() {
       library_metrics: null,
     });
   }
-  // 用户在界面上关掉的技能要按落盘状态回真值（默认开着）
   rows.sort((a, b) => a.name.localeCompare(b.name));
-  skillCache = { at: Date.now(), rows, dirs };
+  skillCache = { at: Date.now(), rows, dirs: byId };
   return skillCache;
 }
 
