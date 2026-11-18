@@ -31,9 +31,9 @@ jobs:
         working-directory: apps/claude-mom
         run: npm ci
 
-      - name: 构建（跳过更新包签名）
+      - name: 构建
         working-directory: apps/claude-mom
-        run: npm run tauri -- build --config '{\"bundle\":{\"createUpdaterArtifacts\":false}}'
+        run: npm run tauri -- build
 
       - name: 收集产物
         shell: bash

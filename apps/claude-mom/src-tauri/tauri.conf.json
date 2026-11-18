@@ -44,7 +44,7 @@
       "minimumSystemVersion": "11.0",
       "signingIdentity": "-"
     },
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": false
   },
   "plugins": {
     "updater": {
