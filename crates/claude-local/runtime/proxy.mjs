@@ -816,13 +816,52 @@ function resolvedBootstrap() {
 
 // REST 侧的会话条目：拿录制文件里的第一条当模板，叠动态字段
 let REST_CONV_TEMPLATE = null;
+// 用户手动开关的技能状态。本地没有服务端，状态只能落在运行时目录里；
+// 没有这一层的话，前端启用后会重新拉列表发现还是 enabled:false，
+// 抛 SkillWriteReadbackError（answered without the written skill row）。
+const SKILL_STATE_FILE = path.join(here, "skills-state.json");
+function readSkillState() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SKILL_STATE_FILE, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+function writeSkillState(state) {
+  try {
+    fs.writeFileSync(SKILL_STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+  } catch {}
+}
+function setSkillEnabled(id, enabled) {
+  const state = readSkillState();
+  state[id] = !!enabled;
+  writeSkillState(state);
+}
+// 录制模板里的技能行，用于回包（启用/停用要带上写入后的整行）。
+function recordedSkills() {
+  try {
+    const data = JSON.parse(fs.readFileSync(path.join(POC_MOCK, "api", "skills.json"), "utf8"));
+    return Array.isArray(data?.skills) ? data.skills : [];
+  } catch {
+    return [];
+  }
+}
 /**
  * 模板里录下的 Anthropic 示例技能，内容只能从 Anthropic 下载，本地模式一个都装不上。
  * 原样标成「已启用」的话，Claude 每次同步都要去下载、全部失败（0 downloaded / 5 failed）。
+ * 默认关闭，但用户在界面上打开过的要按落盘状态回真值。
  */
 function offlineSkills(data) {
   if (!Array.isArray(data?.skills)) return data;
-  return { ...data, skills: data.skills.map((skill) => ({ ...skill, enabled: false })) };
+  const state = readSkillState();
+  return {
+    ...data,
+    skills: data.skills.map((skill) => ({
+      ...skill,
+      enabled: Object.prototype.hasOwnProperty.call(state, skill.id) ? !!state[skill.id] : false,
+    })),
+  };
 }
 
 function restTime(value, fallback) {
@@ -1333,6 +1372,31 @@ function mockApi(req, res, url) {
     // 技能内容在 Anthropic 服务器上，本地拿不到。列表里已经都标成未启用（offlineSkills），
     // 用户手动打开时回一个明确的 404，而不是 204 空体（Claude 会报「Response body is null」）。
     return json(res, { type: "error", error: { type: "not_found_error", message: "本地模式没有这个技能的内容" } }, 404);
+  }
+  // 技能页的组织级列表：前端 select 直接 `data.skills.map(...)`，
+  // 回通用 {} 会抛 TypeError → 触发 fatal error boundary，整页白屏（「无法加载」）。
+  if (method === "GET" && /\/skills\/list-org-skills$/.test(p)) {
+    return json(res, { skills: [] });
+  }
+  // 技能启用/停用：本地没有服务端，状态落盘；回包必须带写入后的技能行，
+  // 否则前端回读校验失败，报 SkillWriteReadbackError。
+  if (method === "POST" && /\/skills\/(?:enable|disable)-skill$/.test(p)) {
+    const enable = /enable-skill$/.test(p);
+    return readBody(req, (raw) => {
+      let body = {};
+      try {
+        body = JSON.parse(raw || "{}");
+      } catch {}
+      const id = body.skill_id || body.skillId || body.id || body.uuid || "";
+      if (id) setSkillEnabled(id, enable);
+      const found = recordedSkills().find((skill) => skill.id === id);
+      const row = found ? { ...found, enabled: enable } : null;
+      return json(res, {
+        ...(row || {}),
+        skills: row ? [row] : [],
+        ...(row ? { skill: row } : {}),
+      });
+    });
   }
   // 登录后组织选择页的数据源；item 的 uuid 要放在客户端读的位置（否则 join 打成 /undefined/join）
   if (p === "/api/organizations/discoverable") {
