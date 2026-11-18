@@ -1101,23 +1101,46 @@ test("RPC replies carry the upstream's HTTP error and RPC conversations open wit
   assert.equal(list.json.find((c) => c.uuid === conv).chat_messages, undefined, "会话列表不带消息");
 });
 
-test("installed template lists its example skills as disabled so Claude does not download them", async () => {
-  // 技能内容只在 Anthropic 服务器上，本地装不上；标成已启用会让每次同步都失败（#16）。
+test("skill list comes from the local skill folders and opens as a zip", async () => {
+  // 技能列表的性能来源是本机磁盘：模板里录的示例技能正文在 Anthropic 服务器上，本地一份都下不来，
+  // 列出来点开只会报错（#16）。这里用 CLAUDE_LOCAL_SKILLS_DIRS 钉一个假技能目录来验证。
   const runtimeDir = path.join(root, "skills-runtime");
   fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
   fs.writeFileSync(path.join(runtimeDir, "mock", ".codex-plus-template"), "");
-  fs.writeFileSync(path.join(runtimeDir, "mock", "api", "skills.json"), JSON.stringify({
-    skills: [{ id: "morning", name: "morning", enabled: true }, { id: "learn", name: "learn", enabled: false }],
-  }));
-  const instance = await start({ CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache") }, runtimeDir);
+  const skillsDir = path.join(root, "local-skills");
+  const skillDir = path.join(skillsDir, "morning");
+  fs.mkdirSync(path.join(skillDir, "references"), { recursive: true });
+  fs.writeFileSync(path.join(skillDir, "SKILL.md"), [
+    "---",
+    "name: morning",
+    'description: "Sort out the morning: calendar, mail, then the day plan."',
+    "---",
+    "",
+    "# Morning",
+  ].join("\n"));
+  fs.writeFileSync(path.join(skillDir, "references", "checklist.md"), "- inbox\n- calendar\n");
+  const instance = await start({
+    CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache"),
+    CLAUDE_LOCAL_SKILLS_DIRS: skillsDir,
+  }, runtimeDir);
   try {
     const list = await request(instance, "/api/organizations/local/skills/list-skills", { host: "claude.ai" });
-    assert.deepEqual(list.json.skills, [{ id: "morning", name: "morning", enabled: false }, { id: "learn", name: "learn", enabled: false }]);
+    assert.equal(list.json.skills.length, 1);
+    assert.equal(list.json.skills[0].id, "morning");
+    assert.equal(list.json.skills[0].description, "Sort out the morning: calendar, mail, then the day plan.");
+    assert.equal(list.json.skills[0].enabled, true);
+    const orgList = await request(instance, "/api/organizations/local/skills/list-org-skills", { host: "claude.ai" });
+    assert.deepEqual(orgList.json.skills.map((s) => s.id), ["morning"]);
     const download = await request(instance, "/api/organizations/local/skills/download-dot-skill-file?skill_id=morning&entrypoint=local-agent", { host: "claude.ai" });
-    assert.equal(download.status, 404);
-    assert.equal(download.json.error.type, "not_found_error");
+    assert.equal(download.status, 200);
+    assert.equal(download.headers["content-type"], "application/zip");
+    assert.equal(download.bytes.subarray(0, 2).toString("utf8"), "PK", "回给前端的必须是能解包的 zip");
+    const missing = await request(instance, "/api/organizations/local/skills/download-dot-skill-file?skill_id=learn", { host: "claude.ai" });
+    assert.equal(missing.status, 404);
+    assert.equal(missing.json.error.type, "not_found_error");
   } finally {
     await stop(instance);
+    fs.rmSync(skillsDir, { recursive: true, force: true });
   }
 });
 

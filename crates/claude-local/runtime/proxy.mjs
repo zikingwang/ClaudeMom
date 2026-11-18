@@ -838,30 +838,273 @@ function setSkillEnabled(id, enabled) {
   state[id] = !!enabled;
   writeSkillState(state);
 }
-// 录制模板里的技能行，用于回包（启用/停用要带上写入后的整行）。
-function recordedSkills() {
+/**
+ * 技能列表改成「磁盘上有什么就显示什么」。
+ *
+ * 模板里录的 15 条 Anthropic 示例技能正文在 Anthropic 服务器上，本地模式一份都下不来：
+ * 列出来点开只会报错，打开开关还会每次同步都下载失败。真正能用的是本机这两处目录：
+ *   - ~/.claude/skills/<name>/SKILL.md
+ *     个人技能目录，Claude Code 和本地 agent 都读这里。
+ *   - %LOCALAPPDATA%/Claude-3p/local-agent-mode-sessions/skills-plugin/<org>/<session>/skills/<name>/SKILL.md
+ *     桌面端把已启用的技能落到这里，本地 agent 实际加载的就是这份。
+ */
+const SKILL_MANIFEST = "SKILL.md";
+const SKILL_SCAN_DEPTH = 5;
+const SKILL_ZIP_LIMIT = 24 * 1024 * 1024;
+const SKILL_CACHE_TTL = 10_000;
+
+function skillRoots() {
+  // 测试和特殊安装可以把技能目录钉死，避免读到跑测试的人自己的技能
+  const override = process.env.CLAUDE_LOCAL_SKILLS_DIRS;
+  if (override) return override.split(path.delimiter).filter(Boolean);
+  const roots = [];
+  const home = os.homedir();
+  if (home) roots.push(path.join(home, ".claude", "skills"));
+  const localAppData = process.env.LOCALAPPDATA || process.env.APPDATA;
+  if (localAppData) {
+    roots.push(path.join(localAppData, "Claude-3p", "local-agent-mode-sessions", "skills-plugin"));
+  }
+  return roots;
+}
+
+function isSkillDir(dir) {
   try {
-    const data = JSON.parse(fs.readFileSync(path.join(POC_MOCK, "api", "skills.json"), "utf8"));
-    return Array.isArray(data?.skills) ? data.skills : [];
+    return fs.statSync(path.join(dir, SKILL_MANIFEST)).isFile();
   } catch {
-    return [];
+    return false;
   }
 }
+
+// 往下按层找技能目录：目录里直接有 SKILL.md 就是技能，否则最多再走 depth 层。
+function collectSkillDirs(dir, depth, out) {
+  if (isSkillDir(dir)) {
+    out.push(dir);
+    return;
+  }
+  if (depth <= 0) return;
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+    // 符号链接也要跟：~/.claude/skills/ego-browser 就是指向别处的软链
+    if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+    collectSkillDirs(path.join(dir, entry.name), depth - 1, out);
+  }
+}
+
+/** SKILL.md 的 frontmatter，只取列表要显示的 name / description。 */
+function skillFrontmatter(file) {
+  let text = "";
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return {};
+  }
+  const head = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!head) return {};
+  const lines = head[1].split(/\r?\n/);
+  const meta = {};
+  for (let i = 0; i < lines.length; i++) {
+    const kv = lines[i].match(/^([A-Za-z0-9_-]+):[ \t]*(.*)$/);
+    if (!kv) continue;
+    const key = kv[1];
+    let value = kv[2].trim();
+    if (/^[>|][+-]?$/.test(value)) {
+      // 块标量：把后面缩进的行拼成一段
+      const parts = [];
+      while (i + 1 < lines.length && (/^[ \t]+\S/.test(lines[i + 1]) || lines[i + 1].trim() === "")) {
+        parts.push(lines[++i].trim());
+      }
+      value = parts.join(" ").replace(/\s+/g, " ").trim();
+    } else if (value.startsWith('"')) {
+      // 双引号串可能折行，也可能含转义引号
+      while (!/(?:^|[^\\])"[ \t]*$/.test(value) && i + 1 < lines.length) {
+        value = `${value} ${lines[++i].trim()}`;
+      }
+      try {
+        value = JSON.parse(value);
+      } catch {
+        value = value.replace(/^"/, "").replace(/"$/, "");
+      }
+    } else if (value.startsWith("'") && value.endsWith("'") && value.length > 1) {
+      value = value.slice(1, -1).replace(/''/g, "'");
+    }
+    meta[key] = value;
+  }
+  return meta;
+}
+
+let skillCache = { at: 0, rows: [], dirs: new Map() };
+
+function scanLocalSkills() {
+  if (Date.now() - skillCache.at < SKILL_CACHE_TTL) return skillCache;
+  const dirs = new Map();
+  for (const root of skillRoots()) {
+    const found = [];
+    collectSkillDirs(root, SKILL_SCAN_DEPTH, found);
+    for (const dir of found) {
+      const name = path.basename(dir);
+      // 同名的以先扫到的为准（个人目录排在 skills-plugin 前面）
+      if (!dirs.has(name)) dirs.set(name, dir);
+    }
+  }
+  const rows = [];
+  for (const [folder, dir] of dirs) {
+    const meta = skillFrontmatter(path.join(dir, SKILL_MANIFEST));
+    const name = typeof meta.name === "string" && meta.name.trim() ? meta.name.trim() : folder;
+    let stat = null;
+    try {
+      stat = fs.statSync(path.join(dir, SKILL_MANIFEST));
+    } catch {}
+    const stamp = (stat?.mtime ?? new Date(0)).toISOString();
+    rows.push({
+      id: name,
+      name,
+      display_name: null,
+      description: typeof meta.description === "string" ? meta.description : "",
+      hooks: null,
+      // 本地技能不走服务端，编辑/删除接口都没有；标成 anthropic 让界面按「只读」处理，
+      // 否则前端会给出改名、删除入口，点了只会 404。
+      creator_type: "anthropic",
+      created_at: stamp,
+      updated_at: stamp,
+      enabled: true,
+      partition_by: "account",
+      is_public_provisioned: false,
+      user_invocable: null,
+      disable_model_invocation: null,
+      source: "local",
+      backing_plugin_id: null,
+      backing_plugin_head_version: null,
+      skill_directory: dir,
+      is_shared: false,
+      has_outgoing_shares: false,
+      shared_via: null,
+      owner: null,
+      enable_count: null,
+      content_scan: null,
+      library_metrics: null,
+    });
+  }
+  // 用户在界面上关掉的技能要按落盘状态回真值（默认开着）
+  rows.sort((a, b) => a.name.localeCompare(b.name));
+  skillCache = { at: Date.now(), rows, dirs };
+  return skillCache;
+}
+
 /**
- * 模板里录下的 Anthropic 示例技能，内容只能从 Anthropic 下载，本地模式一个都装不上。
- * 原样标成「已启用」的话，Claude 每次同步都要去下载、全部失败（0 downloaded / 5 failed）。
- * 默认关闭，但用户在界面上打开过的要按落盘状态回真值。
+ * 列表行。开关状态在每次取用时叠加：扫描结果有缓存（10 秒），
+ * 但刚点完开关要立刻能回读出真值，否则前端报 SkillWriteReadbackError。
  */
-function offlineSkills(data) {
-  if (!Array.isArray(data?.skills)) return data;
+function localSkillRows() {
   const state = readSkillState();
-  return {
-    ...data,
-    skills: data.skills.map((skill) => ({
-      ...skill,
-      enabled: Object.prototype.hasOwnProperty.call(state, skill.id) ? !!state[skill.id] : false,
-    })),
+  return scanLocalSkills().rows.map((row) => ({
+    ...row,
+    enabled: Object.prototype.hasOwnProperty.call(state, row.id) ? !!state[row.id] : true,
+  }));
+}
+
+function localSkillDir(id) {
+  scanLocalSkills();
+  return skillCache.dirs.get(id) ?? null;
+}
+
+const CRC_TABLE = (() => {
+  const table = new Int32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[i] = c;
+  }
+  return table;
+})();
+
+function crc32(buf) {
+  let c = -1;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ -1) >>> 0;
+}
+
+/** 不压缩的 zip：前端 JSZip 解出来就是技能目录的文件树，够用且不引入依赖。 */
+function buildZip(files) {
+  const locals = [];
+  const central = [];
+  let offset = 0;
+  for (const file of files) {
+    const name = Buffer.from(file.path.replace(/\\/g, "/"), "utf8");
+    const data = file.data;
+    const crc = crc32(data);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0800, 6);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    const header = Buffer.alloc(46);
+    header.writeUInt32LE(0x02014b50, 0);
+    header.writeUInt16LE(20, 4);
+    header.writeUInt16LE(20, 6);
+    header.writeUInt16LE(0x0800, 8);
+    header.writeUInt32LE(crc, 16);
+    header.writeUInt32LE(data.length, 20);
+    header.writeUInt32LE(data.length, 24);
+    header.writeUInt16LE(name.length, 28);
+    header.writeUInt32LE(offset, 42);
+    locals.push(local, name, data);
+    central.push(header, name);
+    offset += local.length + name.length + data.length;
+  }
+  const centralBuffer = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(centralBuffer.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, centralBuffer, end]);
+}
+
+function zipSkillDirectory(dir) {
+  const files = [];
+  let total = 0;
+  const walk = (current, prefix, depth) => {
+    if (depth > 8) return;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name === ".git" || entry.name === "node_modules") continue;
+      const full = path.join(current, entry.name);
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      let stat = null;
+      try {
+        stat = fs.statSync(full);
+      } catch {
+        continue;
+      }
+      if (stat.isDirectory()) {
+        walk(full, rel, depth + 1);
+        continue;
+      }
+      if (!stat.isFile() || total + stat.size > SKILL_ZIP_LIMIT) continue;
+      try {
+        const data = fs.readFileSync(full);
+        total += data.length;
+        files.push({ path: rel, data });
+      } catch {}
+    }
   };
+  walk(dir, "", 0);
+  return buildZip(files);
 }
 
 function restTime(value, fallback) {
@@ -1060,6 +1303,7 @@ function mockApi(req, res, url) {
   }
 
   // 录制下来的真实接口形状（mock/api/*.json）
+  // 技能列表不在这里：它的真实来源是本机磁盘上的技能目录，见下面的 scanLocalSkills。
   const apiMap = [
     [/\/reflections\/settings$/, "reflections_settings"],
     [/\/user_settings$/, "claude_code_user_settings"],
@@ -1067,7 +1311,6 @@ function mockApi(req, res, url) {
     [/\/memory\/settings$/, "memory_settings"],
     [/^\/api\/account_profile$/, "account_profile"],
     [/\/trial_status$/, "trial_status"],
-    [/\/skills\/list-skills$/, "skills"],
     [/\/experiences\/claude_web$/, "experiences"],
   ];
   for (const [re, slug] of apiMap) {
@@ -1076,7 +1319,6 @@ function mockApi(req, res, url) {
       if (!dataManaged && fs.existsSync(f)) {
         try {
           const data = JSON.parse(fs.readFileSync(f, "utf8"));
-          if (slug === "skills") return json(res, offlineSkills(data));
           return slug === "account_profile"
             ? jsonWithActiveOrg(res, normalizeAccountProfile(data))
             : json(res, data);
@@ -1368,15 +1610,35 @@ function mockApi(req, res, url) {
   if (/\/memory\/settings/.test(p)) {
     return json(res, { settings: {}, entries: [], items: [] });
   }
-  if (/\/skills\/download-dot-skill-file/.test(p)) {
-    // 技能内容在 Anthropic 服务器上，本地拿不到。列表里已经都标成未启用（offlineSkills），
-    // 用户手动打开时回一个明确的 404，而不是 204 空体（Claude 会报「Response body is null」）。
-    return json(res, { type: "error", error: { type: "not_found_error", message: "本地模式没有这个技能的内容" } }, 404);
+  // 点开某个技能时的技能包下载：直接把磁盘上那个技能目录打成 zip 回给前端
+  // （前端用 JSZip 解包，按文件树展示 SKILL.md 和附带的脚本/参考资料）。
+  if (method === "GET" && /\/skills\/download-dot-skill-file/.test(p)) {
+    const id = url.searchParams.get("skill_id") || "";
+    const dir = id ? localSkillDir(id) : null;
+    if (!dir) {
+      return json(res, { type: "error", error: { type: "not_found_error", message: "本地没有这个技能" } }, 404);
+    }
+    let body;
+    try {
+      body = zipSkillDirectory(dir);
+    } catch {
+      return json(res, { type: "error", error: { type: "api_error", message: "技能目录读取失败" } }, 500);
+    }
+    res.writeHead(200, {
+      "content-type": "application/zip",
+      "content-length": body.length,
+      "cache-control": "no-store",
+    });
+    return res.end(body);
   }
-  // 技能页的组织级列表：前端 select 直接 `data.skills.map(...)`，
+  // 技能页的组织级列表：前端直接 `data.skills.map(...)`，
   // 回通用 {} 会抛 TypeError → 触发 fatal error boundary，整页白屏（「无法加载」）。
   if (method === "GET" && /\/skills\/list-org-skills$/.test(p)) {
-    return json(res, { skills: [] });
+    return json(res, { skills: localSkillRows() });
+  }
+  // 技能列表（同一个页面的另一条路径），同样只回本机真实存在的技能。
+  if (method === "GET" && /\/skills\/list-skills$/.test(p)) {
+    return json(res, { skills: localSkillRows() });
   }
   // 技能启用/停用：本地没有服务端，状态落盘；回包必须带写入后的技能行，
   // 否则前端回读校验失败，报 SkillWriteReadbackError。
@@ -1389,7 +1651,7 @@ function mockApi(req, res, url) {
       } catch {}
       const id = body.skill_id || body.skillId || body.id || body.uuid || "";
       if (id) setSkillEnabled(id, enable);
-      const found = recordedSkills().find((skill) => skill.id === id);
+      const found = localSkillRows().find((skill) => skill.id === id);
       const row = found ? { ...found, enabled: enable } : null;
       return json(res, {
         ...(row || {}),
