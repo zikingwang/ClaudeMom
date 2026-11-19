@@ -1139,6 +1139,29 @@ test("skill list comes from the local skill folders and opens as a zip", async (
     assert.equal(plugins.json.has_more, false);
     const marketplaces = await request(instance, "/api/organizations/local/marketplaces/list-default-marketplaces", { host: "claude.ai" });
     assert.ok(Array.isArray(marketplaces.json.marketplaces));
+    // 「插件」页真正拉的是 directory/plugins：zod 严格校验 {data:[...]}，
+    // 每条记录少一个必填字段就被整条丢掉，data 缺失则整页「无法加载您的插件」。
+    const directory = await request(
+      instance,
+      "/api/organizations/local/directory/plugins?filter=installation.state+in+%5B%27enabled%27%2C+%27disabled%27%5D&limit=1000",
+      { host: "claude.ai" },
+    );
+    assert.equal(directory.status, 200);
+    assert.equal(directory.json.data.length, 1);
+    const record = directory.json.data[0];
+    for (const key of ["id", "name", "summary", "links", "source", "checks", "taxonomy", "components", "tags", "metrics", "installation", "surfaces"]) {
+      assert.notEqual(record[key], undefined, `directory record missing ${key}`);
+    }
+    assert.equal(record.source.type, "anthropic_default");
+    assert.equal(record.components[0].type, "skill");
+    assert.equal(record.installation.state, "enabled");
+    // 「发现」那段查询带 !(installation.state in ...)，本地没有可发现的东西
+    const discovery = await request(
+      instance,
+      "/api/organizations/local/directory/plugins?filter=%28%21%28installation.state+in+%5B%27enabled%27%5D%29%29",
+      { host: "claude.ai" },
+    );
+    assert.deepEqual(discovery.json.data, []);
     const download = await request(instance, "/api/organizations/local/skills/download-dot-skill-file?skill_id=morning&entrypoint=local-agent", { host: "claude.ai" });
     assert.equal(download.status, 200);
     assert.equal(download.headers["content-type"], "application/zip");

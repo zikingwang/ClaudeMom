@@ -1180,6 +1180,74 @@ function findLocalPlugin(idOrName) {
   return plugins.find((plugin) => plugin.id === key || plugin.name === key || plugin.skills[0].id === key) ?? null;
 }
 
+/**
+ * 真正的「插件」页数据源是 `GET /api/organizations/{uuid}/directory/plugins`，
+ * 回包被 zod 严格校验：必须是 `{data: [...]}`，且每条记录必填
+ * id/name/summary/links/source/checks/taxonomy/components/tags/metrics/installation/surfaces，
+ * 少一个字段整条被丢掉；data 缺失连整页都解析失败 →「无法加载您的插件。」。
+ *
+ * 这里按真实 shape 把本机技能目录逐条包装成目录记录：
+ * 一个技能 = 一个 anthropic_default 来源的「插件」，只含一个 type=skill 的组件。
+ */
+const DIRECTORY_SURFACES = ["claude_ai", "claude_code", "claude_desktop", "cowork"];
+
+function localDirectoryRecord(skill) {
+  const enabled = skill.enabled !== false;
+  const summary = skill.description || "本机技能";
+  const access = { type: "runs_on_your_computer" };
+  return {
+    id: `local-skill:${skill.id}`,
+    name: skill.name,
+    slug: skill.id,
+    manifest_name: skill.name,
+    summary,
+    description: skill.description || undefined,
+    media: { icons: [], screenshots: [], videos: [] },
+    // links 是全可选对象，但键必须在：给 null 会被判非法
+    links: {},
+    license: null,
+    added_time: skill.created_at || null,
+    updated_time: skill.updated_at || null,
+    source: { type: "anthropic_default" },
+    checks: {
+      review: { state: "none" },
+      // 本机目录不做内容扫描，直接报「已就绪/通过」，否则会显示成扫描中
+      scan: { state: "ready", assessment: "pass" },
+    },
+    verified_tier: "anthropic",
+    taxonomy: {},
+    components: [{
+      name: skill.name,
+      description: skill.description || undefined,
+      key: `skill:${skill.id}`,
+      type: "skill",
+      skill_id: skill.id,
+      access,
+    }],
+    tags: [{ type: "added_manually" }],
+    metrics: {},
+    // 只有 enabled / disabled 两种状态会出现在「您的插件」里
+    installation: enabled
+      ? { state: "enabled", actions: { disable: true } }
+      : { state: "disabled", actions: { enable: true } },
+    surfaces: DIRECTORY_SURFACES,
+  };
+}
+
+function directoryPluginRows(url) {
+  const rows = localSkillRows().map(localDirectoryRecord);
+  const filter = url?.searchParams?.get("filter") || "";
+  const query = (url?.searchParams?.get("q") || "").trim().toLowerCase();
+  const searched = query
+    ? rows.filter((row) => row.name.toLowerCase().includes(query) || row.summary.toLowerCase().includes(query))
+    : rows;
+  if (!filter) return searched;
+  // 「您的插件」：installation.state in ['enabled','disabled']
+  // 「发现」那段查询是 `!(installation.state in [...])`，本地没有可发现的东西，回空避免重复
+  const wantsInstalled = /installation\.state\s+in\s*\[/.test(filter) && !/!\s*\(\s*installation\.state/.test(filter);
+  return wantsInstalled ? searched : [];
+}
+
 function restTime(value, fallback) {
   const date = value ? new Date(value) : null;
   return date && !Number.isNaN(date.getTime()) ? date.toISOString() : fallback;
@@ -1533,7 +1601,24 @@ function mockApi(req, res, url) {
   // ── 插件与市场：新版「插件」页（Skills 标签）的数据源，全部由本机技能目录合成 ──
   // 这个页面先拉市场列表、再拉插件列表；缺字段会整页变成「无法加载插件。请检查您的网络连接后重试。」
   if (/\/cowork_plugin_metadata$/.test(p)) return json(res, {});
-  if (/\/directory\/plugins$/.test(p)) return json(res, { plugins: [], has_more: false, total: 0 });
+  // 目录页严格校验 {data:[...]}：回 {plugins:[]} 会让整页 zod 解析失败。
+  if (/\/directory\/plugins$/.test(p)) {
+    const rows = directoryPluginRows(url);
+    return json(res, {
+      data: rows,
+      next_page: null,
+      facets: { source: [{ value: "anthropic_default", count: rows.length }] },
+      omitted: [],
+    });
+  }
+  if (/\/directory\/plugins\/[^/]+$/.test(p)) {
+    const key = decodeURIComponent(p.split("/").pop() || "");
+    const found = directoryPluginRows(url).find((row) => row.id === key || row.slug === key || row.name === key);
+    if (!found) {
+      return json(res, { type: "error", error: { type: "not_found_error", message: "本地没有这个插件" } }, 404);
+    }
+    return json(res, found);
+  }
   if (/\/marketplaces\/list-(?:default|account|org)-marketplaces$/.test(p)) {
     // 只有一个虚拟市场：本机技能目录。另外两类回空数组。
     const marketplaces = /list-default-marketplaces$/.test(p) ? [localMarketplaceRow()] : [];
