@@ -1110,6 +1110,76 @@ function zipSkillDirectory(dir) {
   return buildZip(files);
 }
 
+/**
+ * 新版界面的「插件」页把技能当成插件的一种（`presents_as: "skill"`）。
+ * 这个页面先拉市场列表，再拉插件列表；两个接口在本地都没有服务端数据，
+ * 之前一律落到通用 `{}` 兜底，前端读 `marketplaces` / `plugins` 直接抛错，
+ * 整页变成「无法加载插件。请检查您的网络连接后重试。」
+ *
+ * 这里把本机技能目录包装成一个虚拟市场 + 每个技能一个插件行，
+ * 让 Skills 标签页能真的列出磁盘上那些能用的技能。
+ */
+const LOCAL_MARKETPLACE = "local-skills";
+
+function localMarketplaceRow() {
+  const rows = localSkillRows();
+  return {
+    id: LOCAL_MARKETPLACE,
+    name: "local",
+    display_name: "本机技能",
+    displayName: "本机技能",
+    description: "本机磁盘上的技能目录",
+    kind: "custom",
+    marketplace_kind: "custom",
+    is_org_native: false,
+    is_default: true,
+    plugin_count: rows.length,
+    pluginCount: rows.length,
+    created_at: "2026-01-01T00:00:00.000Z",
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function localPluginRows() {
+  return localSkillRows().map((skill) => ({
+    id: `local-skill:${skill.id}`,
+    name: skill.name,
+    display_name: skill.name,
+    description: skill.description,
+    enabled: skill.enabled,
+    // 前端按这个字段把插件归到 Skills 标签页
+    presents_as: "skill",
+    skill: true,
+    marketplace_id: LOCAL_MARKETPLACE,
+    marketplace_name: "local",
+    marketplace_kind: "custom",
+    partition_by: "account",
+    installation_preference: "available",
+    version: "1.0.0",
+    author: null,
+    created_at: skill.created_at,
+    updated_at: skill.updated_at,
+    skills: [{
+      id: skill.id,
+      name: skill.name,
+      invocation_name: skill.name,
+      description: skill.description,
+      skill_directory: skill.skill_directory,
+      user_invocable: true,
+      library_metrics: null,
+    }],
+    commands: [],
+    mcp_servers: [],
+    hooks: [],
+  }));
+}
+
+function findLocalPlugin(idOrName) {
+  const plugins = localPluginRows();
+  const key = String(idOrName || "");
+  return plugins.find((plugin) => plugin.id === key || plugin.name === key || plugin.skills[0].id === key) ?? null;
+}
+
 function restTime(value, fallback) {
   const date = value ? new Date(value) : null;
   return date && !Number.isNaN(date.getTime()) ? date.toISOString() : fallback;
@@ -1460,6 +1530,41 @@ function mockApi(req, res, url) {
     });
   }
 
+  // ── 插件与市场：新版「插件」页（Skills 标签）的数据源，全部由本机技能目录合成 ──
+  // 这个页面先拉市场列表、再拉插件列表；缺字段会整页变成「无法加载插件。请检查您的网络连接后重试。」
+  if (/\/cowork_plugin_metadata$/.test(p)) return json(res, {});
+  if (/\/directory\/plugins$/.test(p)) return json(res, { plugins: [], has_more: false, total: 0 });
+  if (/\/marketplaces\/list-(?:default|account|org)-marketplaces$/.test(p)) {
+    // 只有一个虚拟市场：本机技能目录。另外两类回空数组。
+    const marketplaces = /list-default-marketplaces$/.test(p) ? [localMarketplaceRow()] : [];
+    return json(res, { marketplaces, has_more: false });
+  }
+  if (/\/plugins\/list-plugins$/.test(p)) {
+    const scoped = p.match(/\/marketplaces\/([^/]+)\//)?.[1];
+    const plugins = scoped && scoped !== LOCAL_MARKETPLACE ? [] : localPluginRows();
+    return json(res, {
+      plugins, installed_plugin_ids: plugins.map((plugin) => plugin.id),
+      has_more: false, total: plugins.length,
+    });
+  }
+  if (/\/plugins\/by-name\//.test(p)) {
+    const plugin = findLocalPlugin(decodeURIComponent(p.split("/").pop() || ""));
+    if (!plugin) {
+      return json(res, { type: "error", error: { type: "not_found_error", message: "本地没有这个插件" } }, 404);
+    }
+    return json(res, plugin);
+  }
+  if (/\/plugins\/[^/]+\/versions$/.test(p)) return json(res, { versions: [], has_more: false });
+  if (/\/plugins\/[^/]+\/scan-status$/.test(p)) return json(res, { content_scan: null, status: "clean" });
+  if (/\/plugins\/[^/]+$/.test(p) && !/\/(?:registry|list-plugins)$/.test(p)) {
+    const plugin = findLocalPlugin(decodeURIComponent(p.split("/").pop() || ""));
+    if (!plugin) {
+      return json(res, { type: "error", error: { type: "not_found_error", message: "本地没有这个插件" } }, 404);
+    }
+    return json(res, plugin);
+  }
+  if (/\/marketplaces\//.test(p)) return json(res, { marketplaces: [], has_more: false });
+
   // 分页/列表类接口：客户端会 flatMap 取 .items/.data，回 {} 会出 [undefined] 元素
   // → render 时 TypeError 进 fatal boundary（0NV6PUA 崩溃页的来源）
   // 列表页校验（shared-l-p-m-w-0 rG）：{data:[...], pagination:{has_more:boolean}} 必须成立
@@ -1470,9 +1575,6 @@ function mockApi(req, res, url) {
   if (/\/library(\/|$)/.test(p)) return json(res, pageShape);
   if (/\/projects\/count$/.test(p)) return json(res, { count: 0 });
   if (/\/projects(_v2)?$/.test(p)) return json(res, pageShape);
-  if (/\/plugins\/list-plugins$/.test(p)) {
-    return json(res, { plugins: [], installed_plugin_ids: [] });
-  }
   // Code 模式 OAuth：刷新 token（被通用 /v1/ 兜底吃掉会导致 stale_relogin 常驻）
   if (p === "/v1/oauth/token" && req.method === "POST") {
     return json(res, {
@@ -1506,9 +1608,6 @@ function mockApi(req, res, url) {
       sessions: [], triggers: [], environments: [], data: [], items: [],
       next_cursor: null, has_more: false,
     });
-  }
-  if (/\/marketplaces\//.test(p)) {
-    return json(res, { ...pageShape, marketplaces: [] });
   }
   // /api/frame/types 前端校验必须是 200 + types 数组，否则反复报
   // "frame type catalog 200 without a types list"（issue #26）。
@@ -1918,6 +2017,8 @@ function mockApi(req, res, url) {
     return json(res, coworkSystemPrompts());
   }
   // 未知 API 兜底；有结构要求的接口必须在上方单独实现。
+  // 打一行日志：界面报「加载失败」时，proxy.log 里的 [api-fallback] 就是还没实现的接口。
+  console.log(`[api-fallback] ${method} ${p}`);
   return json(res, {});
 }
 
@@ -2381,6 +2482,11 @@ function handle(req, res, hostHeader) {
   const url = new URL(req.url, `https://${host}`);
   noteClient();
   log(`${req.method} ${url.pathname}`);
+  // 插件页排障：技能/插件这条线的接口形状最容易猜错，把请求原样记进 proxy.log。
+  // 页面报「无法加载插件」时，这几行就是它到底要了什么。
+  if (/plugin|skill|marketplace/i.test(url.pathname)) {
+    console.log(`[plugin-probe] ${req.method} ${url.pathname}${url.search}`);
+  }
 
   const hostName = url.hostname.toLowerCase();
   const isMainClaudeHost = /^(claude\.ai|www\.claude\.ai|claude\.com|www\.claude\.com)$/.test(hostName);

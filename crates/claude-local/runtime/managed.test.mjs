@@ -1131,6 +1131,14 @@ test("skill list comes from the local skill folders and opens as a zip", async (
     assert.equal(list.json.skills[0].enabled, true);
     const orgList = await request(instance, "/api/organizations/local/skills/list-org-skills", { host: "claude.ai" });
     assert.deepEqual(orgList.json.skills.map((s) => s.id), ["morning"]);
+    // 新版界面从「插件」页看技能：插件行必须带 presents_as=skill 和 skills 组件
+    const plugins = await request(instance, "/api/organizations/local/plugins/list-plugins?enabled_only=true&limit=100", { host: "claude.ai" });
+    assert.equal(plugins.json.plugins.length, 1);
+    assert.equal(plugins.json.plugins[0].presents_as, "skill");
+    assert.equal(plugins.json.plugins[0].skills[0].name, "morning");
+    assert.equal(plugins.json.has_more, false);
+    const marketplaces = await request(instance, "/api/organizations/local/marketplaces/list-default-marketplaces", { host: "claude.ai" });
+    assert.ok(Array.isArray(marketplaces.json.marketplaces));
     const download = await request(instance, "/api/organizations/local/skills/download-dot-skill-file?skill_id=morning&entrypoint=local-agent", { host: "claude.ai" });
     assert.equal(download.status, 200);
     assert.equal(download.headers["content-type"], "application/zip");
