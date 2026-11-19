@@ -1626,11 +1626,33 @@ function mockApi(req, res, url) {
   }
   if (/\/plugins\/list-plugins$/.test(p)) {
     const scoped = p.match(/\/marketplaces\/([^/]+)\//)?.[1];
-    const plugins = scoped && scoped !== LOCAL_MARKETPLACE ? [] : localPluginRows();
+    // 关掉一个技能后前端会带 enabled_only=true 回读，这里必须真的过滤掉，
+    // 否则开关看着点了没反应（回读还能找到那一行）。
+    const onlyEnabled = url.searchParams.get("enabled_only") !== "false" && url.searchParams.has("enabled_only");
+    const plugins = (scoped && scoped !== LOCAL_MARKETPLACE ? [] : localPluginRows())
+      .filter((plugin) => (onlyEnabled ? plugin.enabled : true));
     return json(res, {
       plugins, installed_plugin_ids: plugins.map((plugin) => plugin.id),
       has_more: false, total: plugins.length,
     });
+  }
+  // 插件页的开关就是 `PUT /plugins/{backendId}/enabled`（body {enabled:bool}），
+  // 改完前端会再读一次 list-plugins 找 id 对得上的那行，所以这里要回插件行本身。
+  if (method === "PUT" && /\/plugins\/[^/]+\/enabled$/.test(p)) {
+    const raw = decodeURIComponent(p.split("/")[p.split("/").length - 2] || "");
+    const skillId = raw.replace(/^local-skill:/, "");
+    return readBody(req, (body) => {
+      let payload = {};
+      try {
+        payload = JSON.parse(body || "{}");
+      } catch {}
+      setSkillEnabled(skillId, payload.enabled !== false);
+      const row = findLocalPlugin(raw) ?? findLocalPlugin(skillId);
+      return json(res, row ?? { ok: true });
+    });
+  }
+  if (method === "PUT" && /\/installation-preference$/.test(p)) {
+    return readBody(req, () => json(res, { ok: true }));
   }
   if (/\/plugins\/by-name\//.test(p)) {
     const plugin = findLocalPlugin(decodeURIComponent(p.split("/").pop() || ""));
